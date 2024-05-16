@@ -1,15 +1,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sqlite3.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <pthread.h>
 
+#define DATABASE_FILE "tictactoe.db"
 #define PORT 8080
+#define MAX_CLIENTS 2
+#define BUFFER_SIZE 1024
 
 char board[3][3];
 char current_marker;
-int client_socket;
+int server_socket, client_sockets[MAX_CLIENTS];
+int num_clients = 0;
+
+sqlite3 *db;
+
+pthread_mutex_t board_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t chat_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void draw_board() {
     printf("\n-------------\n");
@@ -41,102 +52,144 @@ int check_win() {
     return 0;
 }
 
-void send_move(int row, int col) {
-    char move[2];
-    move[0] = '0' + row;
-    move[1] = '0' + col;
-    send(client_socket, move, sizeof(move), 0);
+void save_game() {
+    char board_str[10];
+    sprintf(board_str, "%c%c%c%c%c%c%c%c%c", board[0][0], board[0][1], board[0][2], board[1][0], board[1][1], board[1][2], board[2][0], board[2][1], board[2][2]);
+
+    char *errmsg;
+    char sql[100];
+    sprintf(sql, "INSERT INTO games (board, current_marker) VALUES ('%s', '%c')", board_str, current_marker);
+
+    int rc = sqlite3_exec(db, sql, NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Error saving game: %s\n", errmsg);
+        sqlite3_free(errmsg);
+    }
 }
 
-void receive_move() {
-    char move[2];
-    recv(client_socket, move, sizeof(move), 0);
-    int row = move[0] - '0';
-    int col = move[1] - '0';
-    board[row][col] = current_marker;
-}
+void load_game() {
+    char *errmsg;
+    char sql[100];
+    sprintf(sql, "SELECT board, current_marker FROM games ORDER BY id DESC LIMIT 1");
 
-int main(int argc, char *argv[]) {
-    int server_socket, valread;
-    struct sockaddr_in address;
-    int opt = 1;
-    int addrlen = sizeof(address);
+    char **result;
+    int rows, cols;
 
-    if ((server_socket = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
+    int rc = sqlite3_get_table(db, sql, &result, &rows, &cols, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Error loading game: %s\n", errmsg);
+        sqlite3_free(errmsg);
+        return;
     }
 
-    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
-
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
-
-    if (bind(server_socket, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-
-    if (listen(server_socket, 3) < 0) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
-
-    if ((client_socket = accept(server_socket, (struct sockaddr *)&address, (socklen_t *)&addrlen)) < 0) {
-        perror("accept");
-        exit(EXIT_FAILURE);
-    }
-
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++) {
-            board[i][j] = ' ';
-        }
-    }
-
-    current_marker = 'X';
-
-    int move_count = 0;
-
-    while (1) {
-        draw_board();
-
-        int row, col;
-        if (current_marker == 'X') {
-            printf("Your move (row col): ");
-            scanf("%d%d", &row, &col);
-
-            if (row < 0 || row > 2 || col < 0 || col > 2 || board[row][col] != ' ') {
-                printf("Invalid move, try again.\n");
-                continue;
+    if (rows == 0) {
+        // No games found, start a new game
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                board[i][j] = ' ';
             }
-
-            board[row][col] = current_marker;
-            send_move(row, col);
-        } else {
-            receive_move();
         }
-
-        move_count++;
-
-        if (check_win()) {
-            draw_board();
-            printf("Player %c wins!\n", current_marker);
-            break;
-        } else if (move_count == 9) {
-            draw_board();
-            printf("It's a tie!\n");
-            break;
+        current_marker = 'X';
+    } else {
+        // Load the last game
+        char *board_str = result[1];
+        for (int i = 0; i < 9; i++) {
+            board[i / 3][i % 3] = board_str[i];
         }
-
-        current_marker = (current_marker == 'X') ? 'O' : 'X';
+        current_marker = result[2][0];
     }
+
+    sqlite3_free_table(result);
+}
+
+void send_message(char *message, int sender_socket) {
+    pthread_mutex_lock(&chat_mutex);
+    for (int i = 0; i < num_clients; i++) {
+        if (client_sockets[i] != sender_socket) {
+            send(client_sockets[i], message, strlen(message), 0);
+        }
+    }
+    pthread_mutex_unlock(&chat_mutex);
+}
+
+void *handle_client(void *arg) {
+    int client_socket = *(int *)arg;
+    char buffer[BUFFER_SIZE];
+    int bytes_received;
+
+    while ((bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0)) > 0) {
+        buffer[bytes_received] = '\0';
+
+        if (buffer[0] == '/') {
+            // Handle game move
+            pthread_mutex_lock(&board_mutex);
+            int row = buffer[1] - '0';
+            int col = buffer[2] - '0';
+
+            if (row >= 0 && row < 3 && col >= 0 && col < 3 && board[row][col] == ' ') {
+                board[row][col] = current_marker;
+                save_game();
+
+                if (check_win()) {
+                    char message[BUFFER_SIZE];
+                    sprintf(message, "Player %c wins!\n", current_marker);
+                    send_message(message, client_socket);
+                    break;
+                } else {
+                    int move_count = 0;
+                    for (int i = 0; i < 3; i++) {
+                        for (int j = 0; j < 3; j++) {
+                            if (board[i][j] != ' ') {
+                                move_count++;
+                            }
+                        }
+                    }
+
+                    if (move_count == 9) {
+                        char message[BUFFER_SIZE] = "It's a tie!\n";
+                        send_message(message, client_socket);
+                        break;
+                    }
+
+                    current_marker = (current_marker == 'X') ? 'O' : 'X';
+                }
+            } else {
+                char message[BUFFER_SIZE] = "Invalid move, try again.\n";
+                send(client_socket, message, strlen(message), 0);
+            }
+            pthread_mutex_unlock(&board_mutex);
+        } else {
+            // Handle chat message
+            char message[BUFFER_SIZE + 32];
+            sprintf(message, "Client %d: %s\n", client_socket, buffer);
+            send_message(message, client_socket);
+        }
+    }
+
+    pthread_mutex_lock(&chat_mutex);
+    for (int i = 0; i < num_clients; i++) {
+        if (client_sockets[i] == client_socket) {
+            client_sockets[i] = -1;
+            break;
+        }
+    }
+    num_clients--;
+    pthread_mutex_unlock(&chat_mutex);
 
     close(client_socket);
-    close(server_socket);
-
-    return 0;
+    return NULL;
 }
+
+int main() {
+    int rc = sqlite3_open(DATABASE_FILE, &db);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Cannot open database: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return 1;
+    }
+
+    char *errmsg;
+    rc = sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS games (id INTEGER PRIMARY KEY, board TEXT, current_marker TEXT)", NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Error creating table: %s\n", errmsg);
+        sqlite3_free(errmsg);
