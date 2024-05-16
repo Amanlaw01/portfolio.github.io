@@ -1,0 +1,142 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+#define PORT 8080
+
+char board[3][3];
+char current_marker;
+int client_socket;
+
+void draw_board() {
+    printf("\n-------------\n");
+    for (int i = 0; i < 3; i++) {
+        printf("| %c | %c | %c |\n", board[i][0], board[i][1], board[i][2]);
+        printf("-------------\n");
+    }
+}
+
+int check_win() {
+    // Check rows
+    for (int i = 0; i < 3; i++) {
+        if (board[i][0] == board[i][1] && board[i][1] == board[i][2] && board[i][0] != ' ')
+            return 1;
+    }
+
+    // Check columns
+    for (int i = 0; i < 3; i++) {
+        if (board[0][i] == board[1][i] && board[1][i] == board[2][i] && board[0][i] != ' ')
+            return 1;
+    }
+
+    // Check diagonals
+    if (board[0][0] == board[1][1] && board[1][1] == board[2][2] && board[0][0] != ' ')
+        return 1;
+    if (board[0][2] == board[1][1] && board[1][1] == board[2][0] && board[0][2] != ' ')
+        return 1;
+
+    return 0;
+}
+
+void send_move(int row, int col) {
+    char move[2];
+    move[0] = '0' + row;
+    move[1] = '0' + col;
+    send(client_socket, move, sizeof(move), 0);
+}
+
+void receive_move() {
+    char move[2];
+    recv(client_socket, move, sizeof(move), 0);
+    int row = move[0] - '0';
+    int col = move[1] - '0';
+    board[row][col] = current_marker;
+}
+
+int main(int argc, char *argv[]) {
+    int server_socket, valread;
+    struct sockaddr_in address;
+    int opt = 1;
+    int addrlen = sizeof(address);
+
+    if ((server_socket = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        perror("setsockopt");
+        exit(EXIT_FAILURE);
+    }
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    if (bind(server_socket, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("bind failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (listen(server_socket, 3) < 0) {
+        perror("listen");
+        exit(EXIT_FAILURE);
+    }
+
+    if ((client_socket = accept(server_socket, (struct sockaddr *)&address, (socklen_t *)&addrlen)) < 0) {
+        perror("accept");
+        exit(EXIT_FAILURE);
+    }
+
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            board[i][j] = ' ';
+        }
+    }
+
+    current_marker = 'X';
+
+    int move_count = 0;
+
+    while (1) {
+        draw_board();
+
+        int row, col;
+        if (current_marker == 'X') {
+            printf("Your move (row col): ");
+            scanf("%d%d", &row, &col);
+
+            if (row < 0 || row > 2 || col < 0 || col > 2 || board[row][col] != ' ') {
+                printf("Invalid move, try again.\n");
+                continue;
+            }
+
+            board[row][col] = current_marker;
+            send_move(row, col);
+        } else {
+            receive_move();
+        }
+
+        move_count++;
+
+        if (check_win()) {
+            draw_board();
+            printf("Player %c wins!\n", current_marker);
+            break;
+        } else if (move_count == 9) {
+            draw_board();
+            printf("It's a tie!\n");
+            break;
+        }
+
+        current_marker = (current_marker == 'X') ? 'O' : 'X';
+    }
+
+    close(client_socket);
+    close(server_socket);
+
+    return 0;
+}
