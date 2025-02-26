@@ -1,3 +1,3 @@
 Open with PC/laptop for better view
 #
-https://amanlaw01.github.io/portfolio.github.io/
+https://aman-ghale.github.io/portfolio.github.io/
